@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::io;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -17,13 +17,25 @@ const MAX_WIDTH: u16 = 110;
 const MAX_SNIPPET_ROWS: u16 = 11; // up to 10 code lines + redaction note
 const ACTION_ROWS: u16 = 4;
 const RECENT_ROWS: u16 = 3;
+const SURVIVAL_TIME: Duration = Duration::from_secs(5);
+const TIMER_BAR_WIDTH: usize = 24;
+const MODES: [(&str, &str); 2] = [
+    ("classic", "endless rounds — cash out anytime"),
+    ("survival", "5s per guess — one miss ends the run"),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Classic,
+    Survival,
+}
 
 struct RecentEntry {
     correct: bool,
     answer: String,
     file_path: String,
     points: u64,
-    guess: String,
+    guess: Option<String>,
 }
 
 /// A round plus its pre-highlighted snippet (styling once, not every frame).
@@ -41,16 +53,20 @@ impl ActiveRound {
 }
 
 enum Phase {
+    ModeSelect {
+        selected: usize,
+    },
     Loading,
     Guess {
         active: ActiveRound,
         selected: usize,
+        deadline: Option<Instant>,
     },
     Reveal {
         active: ActiveRound,
         correct: bool,
         points: u64,
-        guess: String,
+        guess: Option<String>,
     },
 }
 
@@ -65,6 +81,7 @@ enum Action {
 
 struct App<'a> {
     phase: Phase,
+    mode: Mode,
     spinner: usize,
     session: &'a mut SessionStats,
     high_score: u64,
@@ -82,7 +99,8 @@ pub fn run(
     org: &str,
 ) -> io::Result<Option<String>> {
     let mut app = App {
-        phase: Phase::Loading,
+        phase: Phase::ModeSelect { selected: 0 },
+        mode: Mode::Classic,
         spinner: 0,
         session,
         high_score,
@@ -94,11 +112,40 @@ pub fn run(
         terminal.draw(|frame| app.render(frame))?;
 
         match &app.phase {
+            Phase::ModeSelect { .. } => {
+                let Some(action) = poll_action(Duration::from_millis(80))? else {
+                    app.spinner += 1;
+                    continue;
+                };
+                let Phase::ModeSelect { selected } = &mut app.phase else {
+                    unreachable!()
+                };
+                let chosen = match action {
+                    Action::Quit => return Ok(None),
+                    Action::Up => {
+                        *selected = (*selected + MODES.len() - 1) % MODES.len();
+                        None
+                    }
+                    Action::Down => {
+                        *selected = (*selected + 1) % MODES.len();
+                        None
+                    }
+                    Action::Digit(d) if (1..=MODES.len()).contains(&d) => Some(d - 1),
+                    Action::Enter => Some(*selected),
+                    _ => None,
+                };
+                if let Some(idx) = chosen {
+                    app.mode = if idx == 1 { Mode::Survival } else { Mode::Classic };
+                    app.phase = Phase::Loading;
+                }
+            }
             Phase::Loading => match rounds.try_recv() {
                 Ok(Ok(round)) => {
                     app.phase = Phase::Guess {
                         active: ActiveRound::new(round),
                         selected: 0,
+                        deadline: (app.mode == Mode::Survival)
+                            .then(|| Instant::now() + SURVIVAL_TIME),
                     };
                 }
                 Ok(Err(message)) => return Ok(Some(message)),
@@ -114,11 +161,30 @@ pub fn run(
                     app.spinner += 1;
                 }
             },
-            Phase::Guess { .. } => {
-                let Some(action) = poll_action(Duration::from_millis(250))? else {
+            Phase::Guess { deadline, .. } => {
+                let deadline = *deadline;
+                let poll_timeout = match deadline {
+                    Some(d) => d
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(80)),
+                    None => Duration::from_millis(250),
+                };
+                let action = poll_action(poll_timeout)?;
+                if matches!(action, Some(Action::Quit)) {
+                    return Ok(None);
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    // time's up — any non-quit key this tick loses the race
+                    app.resolve_guess(None);
+                    continue;
+                }
+                let Some(action) = action else {
                     continue;
                 };
-                let Phase::Guess { active, selected } = &mut app.phase else {
+                let Phase::Guess {
+                    active, selected, ..
+                } = &mut app.phase
+                else {
                     unreachable!()
                 };
                 let n_options = active.round.options.len();
@@ -140,15 +206,17 @@ pub fn run(
                     _ => None,
                 };
                 if let Some(choice) = locked_in {
-                    app.resolve_guess(choice);
+                    app.resolve_guess(Some(choice));
                 }
             }
-            Phase::Reveal { .. } => {
+            Phase::Reveal { correct, .. } => {
+                let game_over = app.mode == Mode::Survival && !*correct;
                 let Some(action) = poll_action(Duration::from_millis(250))? else {
                     continue;
                 };
                 match action {
                     Action::Quit => return Ok(None),
+                    _ if game_over => return Ok(None),
                     _ => app.phase = Phase::Loading,
                 }
             }
@@ -180,12 +248,13 @@ fn poll_action(timeout: Duration) -> io::Result<Option<Action>> {
 }
 
 impl App<'_> {
-    fn resolve_guess(&mut self, choice: usize) {
+    /// Resolve the round; `None` means the survival timer ran out (no guess).
+    fn resolve_guess(&mut self, choice: Option<usize>) {
         let Phase::Guess { active, .. } = std::mem::replace(&mut self.phase, Phase::Loading) else {
             unreachable!("resolve_guess is only called from the guess phase")
         };
-        let guess = active.round.options[choice].clone();
-        let correct = guess == active.round.answer;
+        let guess = choice.map(|c| active.round.options[c].clone());
+        let correct = guess.as_deref() == Some(active.round.answer.as_str());
 
         self.session.rounds += 1;
         self.session.history.push(correct);
@@ -265,9 +334,12 @@ impl App<'_> {
         let mut bits = vec![
             format!(" CODEGUESSER"),
             self.org.to_string(),
-            format!("round {round_no}"),
-            format!("score {}", self.session.score),
         ];
+        if self.mode == Mode::Survival && !matches!(self.phase, Phase::ModeSelect { .. }) {
+            bits.push("survival".to_string());
+        }
+        bits.push(format!("round {round_no}"));
+        bits.push(format!("score {}", self.session.score));
         if self.session.streak >= 2 {
             bits.push(format!("🔥 {}", self.session.streak));
         }
@@ -356,26 +428,47 @@ impl App<'_> {
         let question = "which repo did this code crawl out of?";
         let inner_width = area.width.saturating_sub(4) as usize;
         let (title, lines): (&str, Vec<Line>) = match &self.phase {
-            Phase::Loading => (question, Vec::new()),
-            Phase::Guess { active, selected } => {
-                let lines = active
-                    .round
-                    .options
+            Phase::ModeSelect { selected } => {
+                let lines = MODES
                     .iter()
                     .enumerate()
-                    .map(|(i, name)| {
+                    .map(|(i, (name, blurb))| {
                         if i == *selected {
                             Line::from(Span::styled(
-                                format!("❯ {}. {name}", i + 1),
+                                format!("❯ {}. {name} — {blurb}", i + 1),
                                 Style::new()
                                     .fg(Color::LightMagenta)
                                     .add_modifier(Modifier::BOLD),
                             ))
                         } else {
-                            Line::from(format!("  {}. {name}", i + 1))
+                            Line::from(format!("  {}. {name} — {blurb}", i + 1))
                         }
                     })
                     .collect();
+                ("choose your mode", lines)
+            }
+            Phase::Loading => (question, Vec::new()),
+            Phase::Guess {
+                active,
+                selected,
+                deadline,
+            } => {
+                let mut lines: Vec<Line> = Vec::with_capacity(ACTION_ROWS as usize);
+                if let Some(deadline) = deadline {
+                    lines.push(timer_line(*deadline));
+                }
+                lines.extend(active.round.options.iter().enumerate().map(|(i, name)| {
+                    if i == *selected {
+                        Line::from(Span::styled(
+                            format!("❯ {}. {name}", i + 1),
+                            Style::new()
+                                .fg(Color::LightMagenta)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::from(format!("  {}. {name}", i + 1))
+                    }
+                }));
                 (question, lines)
             }
             Phase::Reveal {
@@ -404,18 +497,29 @@ impl App<'_> {
                     }
                     Line::from(spans)
                 } else {
-                    Line::from(vec![
-                        Span::styled(
-                            "✗ nope",
-                            Style::new()
-                                .fg(Color::LightRed)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!(" — you guessed {guess}"),
-                            Style::new().fg(Color::Red),
-                        ),
-                    ])
+                    match guess {
+                        Some(guess) => Line::from(vec![
+                            Span::styled(
+                                "✗ nope",
+                                Style::new()
+                                    .fg(Color::LightRed)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!(" — you guessed {guess}"),
+                                Style::new().fg(Color::Red),
+                            ),
+                        ]),
+                        None => Line::from(vec![
+                            Span::styled(
+                                "⏱ time's up",
+                                Style::new()
+                                    .fg(Color::LightRed)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(" — no guess locked in", Style::new().fg(Color::Red)),
+                        ]),
+                    }
                 };
                 let source = Line::from(vec![
                     Span::styled("it was ", Style::new().add_modifier(Modifier::BOLD)),
@@ -431,7 +535,13 @@ impl App<'_> {
                     round.url.clone(),
                     Style::new().add_modifier(Modifier::DIM | Modifier::UNDERLINED),
                 ));
-                let title = if *correct { "nice one" } else { "unlucky" };
+                let title = if *correct {
+                    "nice one"
+                } else if guess.is_none() {
+                    "time's up"
+                } else {
+                    "unlucky"
+                };
                 (title, vec![verdict, source, url])
             }
         };
@@ -458,7 +568,10 @@ impl App<'_> {
                 let tail = if entry.correct {
                     format!(" (+{})", entry.points)
                 } else {
-                    format!(" (guessed {})", entry.guess)
+                    match &entry.guess {
+                        Some(guess) => format!(" (guessed {guess})"),
+                        None => " (timed out)".into(),
+                    }
                 };
                 let spans = vec![
                     mark,
@@ -479,9 +592,13 @@ impl App<'_> {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let hints = match self.phase {
+        let hints = match &self.phase {
+            Phase::ModeSelect { .. } => " ↑↓ / 1-2 choose · enter start · q quit",
             Phase::Loading => " q cash out",
             Phase::Guess { .. } => " ↑↓ / 1-3 choose · enter lock in · q cash out",
+            Phase::Reveal { correct, .. } if self.mode == Mode::Survival && !correct => {
+                " any key → final tab · q quit"
+            }
             Phase::Reveal { .. } => " any key → next round · q cash out",
         };
         frame.render_widget(
@@ -512,10 +629,38 @@ impl App<'_> {
 
     fn phase_round(&self) -> Option<&ActiveRound> {
         match &self.phase {
-            Phase::Loading => None,
+            Phase::ModeSelect { .. } | Phase::Loading => None,
             Phase::Guess { active, .. } | Phase::Reveal { active, .. } => Some(active),
         }
     }
+}
+
+/// Countdown bar for survival mode: seconds remaining plus a block-char
+/// bar that drains and shifts green → yellow → red.
+fn timer_line(deadline: Instant) -> Line<'static> {
+    let secs = deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs_f32();
+    let frac = (secs / SURVIVAL_TIME.as_secs_f32()).clamp(0.0, 1.0);
+    let filled = (frac * TIMER_BAR_WIDTH as f32).round() as usize;
+    let color = if secs > 2.5 {
+        Color::LightGreen
+    } else if secs > 1.0 {
+        Color::LightYellow
+    } else {
+        Color::LightRed
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("⏱ {secs:>3.1}s "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█".repeat(filled), Style::new().fg(color)),
+        Span::styled(
+            "░".repeat(TIMER_BAR_WIDTH - filled),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 /// Truncate styled spans to a display width, appending an ellipsis when
