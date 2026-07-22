@@ -11,6 +11,19 @@ pub struct ReadyContext {
 
 const MIN_REPOS: usize = 3;
 const ORG_ATTEMPTS: usize = 3;
+const MAX_LISTED_ORGS: usize = 20;
+
+/// List an org's repos and require enough of them to build a round.
+pub fn validate_org(client: &Client, org: &str) -> Result<Vec<RepoInfo>, String> {
+    let repos = client.fetch_repos(org)?;
+    if repos.len() < MIN_REPOS {
+        return Err(format!(
+            "need at least {MIN_REPOS} non-empty, non-fork repos in \"{org}\" — found {}",
+            repos.len()
+        ));
+    }
+    Ok(repos)
+}
 
 /// Resolve credentials + org scope, prompting interactively for whatever is
 /// missing (or for everything, with `force`), and validate by listing the
@@ -73,6 +86,8 @@ pub fn ensure_setup(interactive: bool, force: bool) -> Result<ReadyContext, Stri
     // ── org scope ──
     let mut org = cfg.org.clone().unwrap_or_default();
     let mut must_ask = force || cfg.org.is_none();
+    let mut user_orgs: Vec<String> = Vec::new();
+    let mut listed = false;
 
     for attempt in 1..=ORG_ATTEMPTS {
         if must_ask {
@@ -81,13 +96,45 @@ pub fn ensure_setup(interactive: bool, force: bool) -> Result<ReadyContext, Stri
                     "no org configured — run codeguesser once interactively to set one".into(),
                 );
             }
+            if !listed {
+                listed = true;
+                print!("{}", dim("… listing accounts you can pull from"));
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                user_orgs = client.fetch_accounts().unwrap_or_default();
+                print!("\r\x1b[2K");
+                if !user_orgs.is_empty() {
+                    println!("  {}", bold("your accounts:"));
+                    for (i, name) in user_orgs.iter().take(MAX_LISTED_ORGS).enumerate() {
+                        println!("    {}. {name}", i + 1);
+                    }
+                    if user_orgs.len() > MAX_LISTED_ORGS {
+                        println!(
+                            "{}",
+                            dim(&format!(
+                                "    … and {} more (type its name)",
+                                user_orgs.len() - MAX_LISTED_ORGS
+                            ))
+                        );
+                    }
+                }
+            }
             let default = if org.is_empty() {
                 None
             } else {
                 Some(org.as_str())
             };
-            org = ask_line("which GitHub org should snippets come from?", default)
-                .map_err(|e| format!("could not read org: {e}"))?;
+            let question = if user_orgs.is_empty() {
+                "which GitHub org should snippets come from?"
+            } else {
+                "which org should snippets come from? (number or name)"
+            };
+            let answer =
+                ask_line(question, default).map_err(|e| format!("could not read org: {e}"))?;
+            org = match answer.parse::<usize>() {
+                Ok(n) if (1..=user_orgs.len()).contains(&n) => user_orgs[n - 1].clone(),
+                _ => answer,
+            };
             if org.is_empty() {
                 must_ask = true;
                 continue;
@@ -97,16 +144,7 @@ pub fn ensure_setup(interactive: bool, force: bool) -> Result<ReadyContext, Stri
         print!("{}", dim(&format!("… loading repos from {org}")));
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        let outcome = client.fetch_repos(&org).and_then(|repos| {
-            if repos.len() < MIN_REPOS {
-                Err(format!(
-                    "need at least {MIN_REPOS} non-empty, non-fork repos in \"{org}\" — found {}",
-                    repos.len()
-                ))
-            } else {
-                Ok(repos)
-            }
-        });
+        let outcome = validate_org(&client, &org);
         print!("\r\x1b[2K");
 
         match outcome {

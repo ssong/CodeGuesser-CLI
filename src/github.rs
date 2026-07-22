@@ -34,6 +34,34 @@ struct ApiRepo {
 }
 
 #[derive(Deserialize)]
+struct ApiOrg {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct ApiUser {
+    login: String,
+}
+
+/// A repo-listing failure, keeping "no such owner" separate so callers can
+/// retry against a different endpoint.
+enum FetchError {
+    NotFound,
+    Other(String),
+}
+
+impl FetchError {
+    fn into_message(self) -> String {
+        match self {
+            FetchError::NotFound => {
+                "GitHub said 404 — no org or user with that name (or no access)".into()
+            }
+            FetchError::Other(message) => message,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct ApiTree {
     #[serde(default)]
     tree: Vec<ApiTreeEntry>,
@@ -80,19 +108,54 @@ impl Client {
             .set("X-GitHub-Api-Version", "2022-11-28")
     }
 
-    /// All non-fork, non-empty repos in the org (archived included — history is history).
-    pub fn fetch_repos(&self, org: &str) -> Result<Vec<RepoInfo>, String> {
+    /// All non-fork, non-empty repos of an org or user account (archived
+    /// included — history is history). Org repos are tried first; a 404
+    /// means `owner` is a user account, so fall back to the user endpoints
+    /// (the authenticated user's own account includes private repos).
+    pub fn fetch_repos(&self, owner: &str) -> Result<Vec<RepoInfo>, String> {
+        let org_url = format!("https://api.github.com/orgs/{owner}/repos");
+        match self.fetch_repos_at(&org_url, &[("type", "all")]) {
+            Err(FetchError::NotFound) => {}
+            other => return other.map_err(FetchError::into_message),
+        }
+        let own_account = self
+            .fetch_login()
+            .is_ok_and(|login| login.eq_ignore_ascii_case(owner));
+        let outcome = if own_account {
+            self.fetch_repos_at(
+                "https://api.github.com/user/repos",
+                &[("affiliation", "owner")],
+            )
+        } else {
+            let user_url = format!("https://api.github.com/users/{owner}/repos");
+            self.fetch_repos_at(&user_url, &[])
+        };
+        outcome.map_err(FetchError::into_message)
+    }
+
+    /// One paginated repo listing, keeping 404 distinguishable.
+    fn fetch_repos_at(
+        &self,
+        url: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<RepoInfo>, FetchError> {
         let mut repos = Vec::new();
         for page in 1.. {
-            let batch: Vec<ApiRepo> = self
-                .get(&format!("https://api.github.com/orgs/{org}/repos"))
-                .query("type", "all")
+            let mut request = self
+                .get(url)
                 .query("per_page", "100")
-                .query("page", &page.to_string())
+                .query("page", &page.to_string());
+            for (key, value) in extra {
+                request = request.query(key, value);
+            }
+            let batch: Vec<ApiRepo> = request
                 .call()
-                .map_err(describe)?
+                .map_err(|err| match err {
+                    ureq::Error::Status(404, _) => FetchError::NotFound,
+                    other => FetchError::Other(describe(other)),
+                })?
                 .into_json()
-                .map_err(|e| format!("bad response from GitHub: {e}"))?;
+                .map_err(|e| FetchError::Other(format!("bad response from GitHub: {e}")))?;
             let done = batch.len() < 100;
             repos.extend(
                 batch
@@ -108,6 +171,48 @@ impl Client {
             }
         }
         Ok(repos)
+    }
+
+    /// The authenticated user's login.
+    pub fn fetch_login(&self) -> Result<String, String> {
+        let user: ApiUser = self
+            .get("https://api.github.com/user")
+            .call()
+            .map_err(describe)?
+            .into_json()
+            .map_err(|e| format!("bad response from GitHub: {e}"))?;
+        Ok(user.login)
+    }
+
+    /// Accounts the user can pull snippets from: their own login first,
+    /// then the orgs they belong to (best-effort — an org listing failure
+    /// still yields the personal account).
+    pub fn fetch_accounts(&self) -> Result<Vec<String>, String> {
+        let login = self.fetch_login()?;
+        let mut accounts = vec![login];
+        accounts.extend(self.fetch_user_orgs().unwrap_or_default());
+        Ok(accounts)
+    }
+
+    /// Orgs the authenticated user belongs to.
+    pub fn fetch_user_orgs(&self) -> Result<Vec<String>, String> {
+        let mut orgs = Vec::new();
+        for page in 1.. {
+            let batch: Vec<ApiOrg> = self
+                .get("https://api.github.com/user/orgs")
+                .query("per_page", "100")
+                .query("page", &page.to_string())
+                .call()
+                .map_err(describe)?
+                .into_json()
+                .map_err(|e| format!("bad response from GitHub: {e}"))?;
+            let done = batch.len() < 100;
+            orgs.extend(batch.into_iter().map(|o| o.login));
+            if done {
+                break;
+            }
+        }
+        Ok(orgs)
     }
 
     /// List guessable code files on the repo's default branch.

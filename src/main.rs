@@ -11,8 +11,7 @@ mod stats;
 mod tui;
 
 use onboarding::ReadyContext;
-use prompt::{bold, dim, red, yellow};
-use stats::{PersistedStats, SessionStats};
+use prompt::{dim, red};
 use std::io::IsTerminal;
 
 fn main() {
@@ -80,17 +79,14 @@ fn smoke_test(ready: &ReadyContext) -> Result<(), String> {
 
 fn play(ready: ReadyContext) {
     let persisted = stats::load();
-    let mut session = SessionStats::default();
-    let rounds =
-        game::spawn_prefetcher(ready.client.clone(), ready.org.clone(), ready.repos.clone());
 
     let mut terminal = ratatui::init();
     let outcome = tui::run(
         &mut terminal,
-        rounds,
-        &mut session,
-        persisted.high_score,
-        &ready.org,
+        ready.client,
+        ready.org,
+        ready.repos,
+        persisted,
     );
     ratatui::restore();
 
@@ -103,50 +99,5 @@ fn play(ready: ReadyContext) {
         Err(err) => eprintln!("\n{}", red(&format!("  terminal error: {err}"))),
     }
 
-    summary(&session, &persisted);
-
-    if session.rounds > 0 {
-        stats::save(&PersistedStats {
-            high_score: persisted.high_score.max(session.score),
-            best_streak: persisted.best_streak.max(session.best_streak),
-            games_played: persisted.games_played + 1,
-            total_rounds: persisted.total_rounds + session.rounds,
-            total_correct: persisted.total_correct + session.correct,
-        });
-
-        if prompt::ask_yes_no("generate a share card for your run?") {
-            let card =
-                share::build_share_card(&session, session.score > persisted.high_score, &ready.org);
-            println!("\n{card}");
-            if share::copy_to_clipboard(&card) {
-                println!("{}", dim("\n  (copied to clipboard — paste it in slack)"));
-            }
-        }
-    }
     println!("{}", dim("\n  thanks for playing codeguesser 👋\n"));
-}
-
-fn summary(session: &SessionStats, persisted: &PersistedStats) {
-    let accuracy = (session.correct * 100)
-        .checked_div(session.rounds)
-        .unwrap_or(0);
-    let new_high = session.rounds > 0 && session.score > persisted.high_score;
-    println!("\n{}", bold(&format!("──── final tab {}", "─".repeat(25))));
-    let score_note = if new_high {
-        yellow("  🏆 new high score!")
-    } else {
-        dim(&format!(
-            "  (high score: {})",
-            persisted.high_score.max(session.score)
-        ))
-    };
-    println!(
-        "  score        {}{score_note}",
-        bold(&session.score.to_string())
-    );
-    println!(
-        "  rounds       {} · {} correct · {accuracy}%",
-        session.rounds, session.correct
-    );
-    println!("  best streak  {}", session.best_streak);
 }
